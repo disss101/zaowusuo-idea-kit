@@ -1,5 +1,5 @@
 import { env } from 'cloudflare:workers';
-import { catalog, InputError } from '../../../lib/planner.mjs';
+import { catalog, normalizeRequest, InputError } from '../../../lib/planner.mjs';
 import { generateAiPlan, AiServiceError } from '../../../lib/ai-design.mjs';
 import { examples, exampleCsv } from '../../../lib/examples.mjs';
 import { prepareOrder } from '../../../lib/orders.mjs';
@@ -144,12 +144,18 @@ async function design(input, request) {
   const userId = currentUser(request);
   if (!userId) return json({ error: '请先登录，再生成 AI 方案。' }, 401);
   if (!env.DEEPSEEK_API_KEY) return json({ error: 'AI 服务尚未配置，请稍后再试。' }, 503);
+  const normalized = normalizeRequest(input);
   const userHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId))), x => x.toString(16).padStart(2, '0')).join('');
+  const requestHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({ version: 2, normalized })))), x => x.toString(16).padStart(2, '0')).join('');
+  const cacheKey = `ai-cache/${userHash}/${requestHash}.json`;
+  const cached = await bucket().get(cacheKey);
+  if (cached) return json(await cached.json());
   const date = new Date().toISOString().slice(0, 10);
   const prefix = `ai-usage/${userHash}/${date}/`;
   const usage = await bucket().list({ prefix, limit: dailyAiLimit });
   if (usage.objects.length >= dailyAiLimit) return json({ error: '今天的 AI 生成次数已用完，明天再来试试。' }, 429);
-  const result = await generateAiPlan(input, { apiKey: env.DEEPSEEK_API_KEY });
+  const result = await generateAiPlan(normalized, { apiKey: env.DEEPSEEK_API_KEY });
+  await bucket().put(cacheKey, JSON.stringify(result), { httpMetadata: { contentType: 'application/json' } });
   await bucket().put(`${prefix}${crypto.randomUUID()}.json`, JSON.stringify({ at: new Date().toISOString() }), { httpMetadata: { contentType: 'application/json' } });
   return json(result);
 }
