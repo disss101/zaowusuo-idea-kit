@@ -1,11 +1,13 @@
 import { env } from 'cloudflare:workers';
-import { catalog, plan, InputError } from '../../../lib/planner.mjs';
+import { catalog, InputError } from '../../../lib/planner.mjs';
+import { generateAiPlan, AiServiceError } from '../../../lib/ai-design.mjs';
 import { examples, exampleCsv } from '../../../lib/examples.mjs';
 
 export const dynamic = 'force-dynamic';
 
 const categories = new Set(['桌面装置', '智能家居', '学习实验', '生活工具', '其他创意']);
 const limits = { upload: 25 * 1024 * 1024, file: 10 * 1024 * 1024 };
+const dailyAiLimit = 10;
 const formats = {
   pdf: { type: 'application/pdf', valid: b => bytes(b, [37, 80, 68, 70, 45]) },
   png: { type: 'image/png', valid: b => bytes(b, [137, 80, 78, 71, 13, 10, 26, 10]) },
@@ -132,6 +134,19 @@ async function download(id, section, fileId, request) {
   if (section === 'files') headers['Content-Disposition'] = `attachment; filename="download.${file.extension}"; filename*=UTF-8''${encodeURIComponent(file.name)}`;
   return new Response(request.method === 'HEAD' ? null : object.body, { headers });
 }
+async function design(input, request) {
+  const userId = request.headers.get('oai-authenticated-user-id');
+  if (!userId) return json({ error: '请先登录，再生成 AI 方案。' }, 401);
+  if (!env.DEEPSEEK_API_KEY) return json({ error: 'AI 服务尚未配置，请稍后再试。' }, 503);
+  const userHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId))), x => x.toString(16).padStart(2, '0')).join('');
+  const date = new Date().toISOString().slice(0, 10);
+  const prefix = `ai-usage/${userHash}/${date}/`;
+  const usage = await bucket().list({ prefix, limit: dailyAiLimit });
+  if (usage.objects.length >= dailyAiLimit) return json({ error: '今天的 AI 生成次数已用完，明天再来试试。' }, 429);
+  const result = await generateAiPlan(input, { apiKey: env.DEEPSEEK_API_KEY });
+  await bucket().put(`${prefix}${crypto.randomUUID()}.json`, JSON.stringify({ at: new Date().toISOString() }), { httpMetadata: { contentType: 'application/json' } });
+  return json(result);
+}
 async function handle(request) {
   const url = new URL(request.url);
   const path = url.pathname.split('/').filter(Boolean).slice(1);
@@ -141,7 +156,7 @@ async function handle(request) {
     if (path.join('/') === 'works') return createWork(request);
     if (Number(request.headers.get('content-length') || 0) > 16000) return json({ error: '内容过长。' }, 413);
     const input = await request.json().catch(() => { throw new InputError('请求格式不正确。'); });
-    if (path.join('/') === 'design') return json(plan(input));
+    if (path.join('/') === 'design') return design(input, request);
     if (path.join('/') === 'events') {
       const allowed = ['visit', 'design_start', 'design_complete', 'buy_click', 'feedback'];
       if (!allowed.includes(input.event) || typeof input.session !== 'string' || !/^[\w-]{10,80}$/.test(input.session)) throw new InputError('记录格式不正确。');
@@ -159,7 +174,15 @@ async function handle(request) {
   if (request.method !== 'GET' && request.method !== 'HEAD') return json({ error: '请求方式不支持。' }, 405);
   if (path.join('/') === 'catalog') return json(catalog);
   if (path.join('/') === 'health') return json({ ok: true, mode: 'course-demo', storage: 'r2' });
-  if (path.join('/') === 'auth') return json({ authenticated: !!request.headers.get('oai-authenticated-user-id') });
+  if (path.join('/') === 'auth') {
+    const authenticated = !!request.headers.get('oai-authenticated-user-id');
+    const encoded = request.headers.get('oai-authenticated-user-full-name');
+    let displayName = request.headers.get('oai-authenticated-user-email') || '造物玩家';
+    if (encoded && request.headers.get('oai-authenticated-user-full-name-encoding') === 'percent-encoded-utf-8') {
+      try { displayName = decodeURIComponent(encoded); } catch {}
+    }
+    return json({ authenticated, displayName: authenticated ? displayName : null });
+  }
   if (path.join('/') === 'works') return json(await listWorks(url.searchParams));
   if (path.length === 2 && path[0] === 'works' && /^[a-z0-9-]{6,60}$/.test(path[1])) {
     const work = examples.find(item => item.id === path[1]) || await savedWork(path[1]);
@@ -173,6 +196,7 @@ export async function HEAD(request) { try { return await handle(request); } catc
 export async function POST(request) { try { return await handle(request); } catch (error) { return failure(error); } }
 function failure(error) {
   if (error instanceof InputError) return json({ error: error.message }, 400);
+  if (error instanceof AiServiceError) return json({ error: error.message }, 502);
   console.error(error);
   return json({ error: '暂时无法完成，请稍后重试。' }, 500);
 }
