@@ -2,12 +2,18 @@ import { env } from 'cloudflare:workers';
 import { catalog, InputError } from '../../../lib/planner.mjs';
 import { generateAiPlan, AiServiceError } from '../../../lib/ai-design.mjs';
 import { examples, exampleCsv } from '../../../lib/examples.mjs';
+import { prepareOrder } from '../../../lib/orders.mjs';
 
 export const dynamic = 'force-dynamic';
 
 const categories = new Set(['桌面装置', '智能家居', '学习实验', '生活工具', '其他创意']);
 const limits = { upload: 25 * 1024 * 1024, file: 10 * 1024 * 1024 };
 const dailyAiLimit = 10;
+function currentUser(request) { return request.headers.get('oai-authenticated-user-id'); }
+function isStaff(request) {
+  const email = request.headers.get('oai-authenticated-user-email')?.trim().toLowerCase();
+  return !!email && !!env.ADMIN_EMAIL && env.ADMIN_EMAIL.split(',').some(item => item.trim().toLowerCase() === email);
+}
 const formats = {
   pdf: { type: 'application/pdf', valid: b => bytes(b, [37, 80, 68, 70, 45]) },
   png: { type: 'image/png', valid: b => bytes(b, [137, 80, 78, 71, 13, 10, 26, 10]) },
@@ -135,7 +141,7 @@ async function download(id, section, fileId, request) {
   return new Response(request.method === 'HEAD' ? null : object.body, { headers });
 }
 async function design(input, request) {
-  const userId = request.headers.get('oai-authenticated-user-id');
+  const userId = currentUser(request);
   if (!userId) return json({ error: '请先登录，再生成 AI 方案。' }, 401);
   if (!env.DEEPSEEK_API_KEY) return json({ error: 'AI 服务尚未配置，请稍后再试。' }, 503);
   const userHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId))), x => x.toString(16).padStart(2, '0')).join('');
@@ -146,6 +152,37 @@ async function design(input, request) {
   const result = await generateAiPlan(input, { apiKey: env.DEEPSEEK_API_KEY });
   await bucket().put(`${prefix}${crypto.randomUUID()}.json`, JSON.stringify({ at: new Date().toISOString() }), { httpMetadata: { contentType: 'application/json' } });
   return json(result);
+}
+async function getOrders(request, staff = false) {
+  const userId = currentUser(request);
+  if (!userId) return json({ error: '请先登录。' }, 401);
+  if (staff && !isStaff(request)) return json({ error: '没有工作人员权限。' }, 403);
+  const page = await bucket().list({ prefix: 'orders/', limit: 1000 });
+  const records = (await Promise.all(page.objects.map(async object => {
+    const stored = await bucket().get(object.key);
+    return stored ? stored.json() : null;
+  }))).filter(Boolean).filter(order => staff || order.ownerId === userId).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return json({ items: records.slice(0, 100), truncated: page.truncated || records.length > 100 });
+}
+async function createOrder(input, request) {
+  const userId = currentUser(request);
+  if (!userId) return json({ error: '请先登录，再提交订单需求。' }, 401);
+  const order = prepareOrder(input, userId);
+  await bucket().put(`orders/${order.id}.json`, JSON.stringify(order), { httpMetadata: { contentType: 'application/json' } });
+  return json({ id: order.id, status: order.status, paymentStatus: order.paymentStatus, estimateCny: order.estimateCny }, 201);
+}
+async function updateOrder(id, input, request) {
+  if (!isStaff(request)) return json({ error: '没有工作人员权限。' }, 403);
+  if (!/^[a-f0-9-]{36}$/.test(id)) return json({ error: '订单不存在。' }, 404);
+  if (!['pending_review', 'reviewing', 'needs_changes', 'closed'].includes(input?.status)) throw new InputError('订单状态无效。');
+  const key = `orders/${id}.json`;
+  const stored = await bucket().get(key);
+  if (!stored) return json({ error: '订单不存在。' }, 404);
+  const order = await stored.json();
+  order.status = input.status;
+  order.updatedAt = new Date().toISOString();
+  await bucket().put(key, JSON.stringify(order), { httpMetadata: { contentType: 'application/json' } });
+  return json({ id: order.id, status: order.status });
 }
 async function handle(request) {
   const url = new URL(request.url);
@@ -168,7 +205,8 @@ async function handle(request) {
       await bucket().put(`events/${Date.now()}-${crypto.randomUUID()}.json`, JSON.stringify(record));
       return json({ ok: true });
     }
-    if (path.join('/') === 'orders') return json({ error: '线上暂未开放购买意向提交，请先浏览和分享作品。' }, 503);
+    if (path.join('/') === 'orders') return createOrder(input, request);
+    if (path.length === 4 && path[0] === 'staff' && path[1] === 'orders' && path[3] === 'status') return updateOrder(path[2], input, request);
     return json({ error: '接口不存在。' }, 404);
   }
   if (request.method !== 'GET' && request.method !== 'HEAD') return json({ error: '请求方式不支持。' }, 405);
@@ -181,8 +219,10 @@ async function handle(request) {
     if (encoded && request.headers.get('oai-authenticated-user-full-name-encoding') === 'percent-encoded-utf-8') {
       try { displayName = decodeURIComponent(encoded); } catch {}
     }
-    return json({ authenticated, displayName: authenticated ? displayName : null });
+    return json({ authenticated, displayName: authenticated ? displayName : null, isStaff: authenticated && isStaff(request) });
   }
+  if (path.join('/') === 'orders') return getOrders(request);
+  if (path.join('/') === 'staff/orders') return getOrders(request, true);
   if (path.join('/') === 'works') return json(await listWorks(url.searchParams));
   if (path.length === 2 && path[0] === 'works' && /^[a-z0-9-]{6,60}$/.test(path[1])) {
     const work = examples.find(item => item.id === path[1]) || await savedWork(path[1]);
