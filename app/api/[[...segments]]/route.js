@@ -67,19 +67,68 @@ async function allWorks() {
   } while (cursor);
   return records;
 }
+async function actorKey(id) {
+  return Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(id))), byte => byte.toString(16).padStart(2, '0')).join('');
+}
+const engagementKinds = new Set(['likes', 'favorites', 'unlocks']);
+async function engagementCounts() {
+  const counts = {};
+  let cursor;
+  do {
+    const page = await bucket().list({ prefix: 'engagement/', limit: 1000, cursor });
+    for (const object of page.objects) {
+      const [, id, kind] = object.key.split('/');
+      if (!engagementKinds.has(kind)) continue;
+      counts[id] ||= { likes: 0, favorites: 0, unlocks: 0 };
+      counts[id][kind] += 1;
+    }
+    cursor = page.truncated ? page.cursor : undefined;
+  } while (cursor);
+  return counts;
+}
+async function engagementFor(id, request) {
+  const signedIn = await actor(request);
+  if (!signedIn) return { liked: false, favorited: false, unlocked: false };
+  const hash = await actorKey(signedIn.id);
+  const [liked, favorited, unlocked] = await Promise.all(['likes', 'favorites', 'unlocks'].map(kind => bucket().head(`engagement/${id}/${kind}/${hash}.json`)));
+  return { liked: !!liked, favorited: !!favorited, unlocked: !!unlocked };
+}
+async function workWithStats(work, request) {
+  const [counts, engagement] = await Promise.all([engagementCounts(), engagementFor(work.id, request)]);
+  return { ...publicWork(work), stats: counts[work.id] || { likes: 0, favorites: 0, unlocks: 0 }, engagement };
+}
+async function setEngagement(id, kind, active, request) {
+  const signedIn = await actor(request);
+  if (!signedIn) return json({ error: '请先登录，再参与作品互动。' }, 401);
+  if (!engagementKinds.has(kind)) throw new InputError('互动类型无效。');
+  const work = examples.find(item => item.id === id) || await savedWork(id);
+  if (!work) return json({ error: '作品不存在。' }, 404);
+  const hash = await actorKey(signedIn.id);
+  const key = `engagement/${id}/${kind}/${hash}.json`;
+  if (kind === 'unlocks') {
+    if (!await bucket().head(key)) await bucket().put(key, JSON.stringify({ at: new Date().toISOString() }));
+  } else if (active === true) {
+    if (!await bucket().head(key)) await bucket().put(key, JSON.stringify({ at: new Date().toISOString() }));
+  } else if (active === false) {
+    await bucket().delete(key);
+  } else throw new InputError('互动状态无效。');
+  return json({ stats: (await engagementCounts())[id] || { likes: 0, favorites: 0, unlocks: 0 }, engagement: await engagementFor(id, request) });
+}
 async function listWorks(params) {
   const q = String(params.get('q') || '').trim().toLowerCase().slice(0, 100);
   const category = String(params.get('category') || '').trim();
   const kind = String(params.get('kind') || 'all');
+  const sort = String(params.get('sort') || 'recent');
+  if (!['recent', 'likes', 'favorites', 'unlocks'].includes(sort)) throw new InputError('排序方式无效。');
   const page = Math.max(1, Math.min(10000, Number.parseInt(params.get('page') || '1', 10) || 1));
-  const records = (await allWorks()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const [records, counts] = await Promise.all([allWorks(), engagementCounts()]);
   const matching = records.concat(examples).filter(work =>
     (kind === 'all' || (kind === 'example' && work.isExample) || (kind === 'community' && !work.isExample)) &&
     (!category || work.category === category) &&
     (!q || [work.title, work.summary, work.author, work.description].some(x => x.toLowerCase().includes(q)))
-  );
+  ).sort((a, b) => (sort === 'recent' ? 0 : (counts[b.id]?.[sort] || 0) - (counts[a.id]?.[sort] || 0)) || b.createdAt.localeCompare(a.createdAt));
   const pageSize = 8;
-  return { items: matching.slice((page - 1) * pageSize, page * pageSize).map(publicWork), page, pageSize, total: matching.length, pages: Math.max(1, Math.ceil(matching.length / pageSize)) };
+  return { items: matching.slice((page - 1) * pageSize, page * pageSize).map(work => ({ ...publicWork(work), stats: counts[work.id] || { likes: 0, favorites: 0, unlocks: 0 } })), page, pageSize, total: matching.length, pages: Math.max(1, Math.ceil(matching.length / pageSize)) };
 }
 async function createWork(request) {
   const userId = (await actor(request))?.id;
@@ -95,7 +144,7 @@ async function createWork(request) {
   const category = clean(form.get('category'), '分类', 2, 20);
   if (!categories.has(category)) throw new InputError('作品分类无效。');
   const unlockPriceCoins = Number(form.get('unlockPriceCoins') ?? 20);
-  if (!Number.isSafeInteger(unlockPriceCoins) || unlockPriceCoins < 0 || unlockPriceCoins > 500) throw new InputError('造物 B 参考解锁价需要为 0–500 的整数。');
+  if (!Number.isSafeInteger(unlockPriceCoins) || unlockPriceCoins < 0 || unlockPriceCoins > 500) throw new InputError('造物币参考解锁价需要为 0–500 的整数。');
   if (form.get('rights') !== 'yes') throw new InputError('请确认你有权分享这些文件。');
   let bom;
   try { bom = JSON.parse(form.get('bom')); } catch { throw new InputError('配件表格式不正确。'); }
@@ -135,6 +184,7 @@ async function createWork(request) {
   return json(publicWork(record), 201);
 }
 async function download(id, section, fileId, request) {
+  if (section === 'files' && !(await engagementFor(id, request)).unlocked) return json({ error: '请先登录并解锁作品后下载。' }, 403);
   const example = examples.find(work => work.id === id);
   if (example) {
     if (section === 'cover' && fileId === 'cover') return Response.redirect(new URL(example.coverUrl, request.url), 302);
@@ -238,6 +288,7 @@ async function handle(request) {
       return json(await updatePhone(bucket(), signedIn.local, input.phone));
     }
     if (path.join('/') === 'design') return design(input, request);
+    if (path.length === 3 && path[0] === 'works' && path[2] === 'engagement') return setEngagement(path[1], input.kind, input.active, request);
     if (path.join('/') === 'clarify') return clarify(input, request);
     if (path.join('/') === 'events') {
       const allowed = ['visit', 'design_start', 'design_complete', 'buy_click', 'feedback'];
@@ -256,7 +307,7 @@ async function handle(request) {
   }
   if (request.method !== 'GET' && request.method !== 'HEAD') return json({ error: '请求方式不支持。' }, 405);
   if (path.join('/') === 'catalog') return json(catalog);
-  if (path.join('/') === 'pricing') return json({ unit: '造物 B', coinsPerYuan: 10, generationPreview: 5, exampleUnlock: 0, communitySuggestedUnlock: 20, transactionsEnabled: false });
+  if (path.join('/') === 'pricing') return json({ unit: '造物币', coinsPerYuan: 10, generationPreview: 5, exampleUnlock: 0, communitySuggestedUnlock: 20, transactionsEnabled: false });
   if (path.join('/') === 'health') return json({ ok: true, mode: 'course-demo', storage: 'r2' });
   if (path.join('/') === 'auth') {
     const signedIn = await actor(request);
@@ -274,7 +325,7 @@ async function handle(request) {
   if (path.join('/') === 'works') return json(await listWorks(url.searchParams));
   if (path.length === 2 && path[0] === 'works' && /^[a-z0-9-]{6,60}$/.test(path[1])) {
     const work = examples.find(item => item.id === path[1]) || await savedWork(path[1]);
-    return work ? json(publicWork(work)) : json({ error: '作品不存在。' }, 404);
+    return work ? json(await workWithStats(work, request)) : json({ error: '作品不存在。' }, 404);
   }
   if (path.length === 4 && path[0] === 'works' && ['cover', 'files'].includes(path[2]) && /^[a-z0-9-]{3,60}$/.test(path[3])) return download(path[1], path[2], path[3], request);
   return json({ error: '接口不存在。' }, 404);
