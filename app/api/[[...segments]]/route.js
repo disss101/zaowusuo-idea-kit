@@ -3,6 +3,7 @@ import { catalog, normalizeRequest, InputError } from '../../../lib/planner.mjs'
 import { askClarifyingQuestions, generateAiPlan, AiServiceError } from '../../../lib/ai-design.mjs';
 import { examples, exampleCsv } from '../../../lib/examples.mjs';
 import { prepareOrder } from '../../../lib/orders.mjs';
+import { paymentDb, walletFor, paymentsFor, paymentFor, createTopup, createOrderPayment, submitTransfer, reviewTransfer } from '../../../lib/payments.mjs';
 import { AuthError, login, logout, publicProfile, register, sessionAccount, updatePhone } from '../../../lib/local-auth.mjs';
 
 export const dynamic = 'force-dynamic';
@@ -265,6 +266,49 @@ async function updateOrder(id, input, request) {
   await bucket().put(key, JSON.stringify(order), { httpMetadata: { contentType: 'application/json' } });
   return json({ id: order.id, status: order.status });
 }
+async function quoteOrder(id, input, request) {
+  if (!isStaff(request, await actor(request))) return json({ error: '没有工作人员权限。' }, 403);
+  if (!/^[a-f0-9-]{36}$/.test(id)) return json({ error: '订单不存在。' }, 404);
+  const quoteCny = Number(input?.quoteCny);
+  if (!Number.isSafeInteger(quoteCny) || quoteCny < 1 || quoteCny > 50000) throw new InputError('请填写 1–50000 元的整数报价。');
+  const key = `orders/${id}.json`;
+  const stored = await bucket().get(key);
+  if (!stored) return json({ error: '订单不存在。' }, 404);
+  const existing = await paymentDb(env).prepare("SELECT id FROM payment_requests WHERE order_id = ? AND status IN ('awaiting_transfer', 'submitted', 'confirmed') LIMIT 1").bind(id).first();
+  if (existing) throw new InputError('这笔订单已有付款申请，不能修改报价。');
+  const order = await stored.json();
+  if (order.status === 'closed') throw new InputError('已关闭订单不能报价。');
+  order.quoteCny = quoteCny;
+  order.status = 'reviewing';
+  order.updatedAt = new Date().toISOString();
+  await bucket().put(key, JSON.stringify(order), { httpMetadata: { contentType: 'application/json' } });
+  return json({ id, quoteCny, status: order.status });
+}
+async function paymentAction(path, input, request) {
+  const signedIn = await actor(request);
+  if (!signedIn) return json({ error: '请先登录。' }, 401);
+  const db = paymentDb(env);
+  if (path.join('/') === 'payments/topup') return json(await createTopup(db, signedIn.id, Number(input?.amountFen)), 201);
+  if (path.join('/') === 'payments/order') {
+    const id = String(input?.orderId || '');
+    if (!/^[a-f0-9-]{36}$/.test(id)) throw new InputError('订单编号无效。');
+    const stored = await bucket().get(`orders/${id}.json`);
+    if (!stored) return json({ error: '订单不存在。' }, 404);
+    return json(await createOrderPayment(db, await stored.json(), signedIn.id), 201);
+  }
+  if (path.length === 3 && path[0] === 'payments' && path[2] === 'submit') {
+    const payment = await paymentFor(db, path[1], signedIn.id);
+    if (!payment) return json({ error: '付款申请不存在。' }, 404);
+    return json(await submitTransfer(db, payment, input?.transactionRef));
+  }
+  if (path.length === 4 && path[0] === 'staff' && path[1] === 'payments' && path[3] === 'review') {
+    if (!isStaff(request, signedIn)) return json({ error: '没有工作人员权限。' }, 403);
+    const payment = await paymentFor(db, path[2], signedIn.id, true);
+    if (!payment) return json({ error: '付款申请不存在。' }, 404);
+    return json(await reviewTransfer(db, payment, input?.action, input?.note, signedIn.id));
+  }
+  return json({ error: '接口不存在。' }, 404);
+}
 async function handle(request) {
   const url = new URL(request.url);
   const path = url.pathname.split('/').filter(Boolean).slice(1);
@@ -303,11 +347,13 @@ async function handle(request) {
     }
     if (path.join('/') === 'orders') return createOrder(input, request);
     if (path.length === 4 && path[0] === 'staff' && path[1] === 'orders' && path[3] === 'status') return updateOrder(path[2], input, request);
+    if (path.length === 4 && path[0] === 'staff' && path[1] === 'orders' && path[3] === 'quote') return quoteOrder(path[2], input, request);
+    if (path[0] === 'payments' || (path[0] === 'staff' && path[1] === 'payments')) return paymentAction(path, input, request);
     return json({ error: '接口不存在。' }, 404);
   }
   if (request.method !== 'GET' && request.method !== 'HEAD') return json({ error: '请求方式不支持。' }, 405);
   if (path.join('/') === 'catalog') return json(catalog);
-  if (path.join('/') === 'pricing') return json({ unit: '造物币', coinsPerYuan: 10, generationPreview: 5, exampleUnlock: 0, communitySuggestedUnlock: 20, transactionsEnabled: false });
+  if (path.join('/') === 'pricing') return json({ unit: '造物币', coinsPerYuan: 10, generationPreview: 5, exampleUnlock: 0, communitySuggestedUnlock: 20, paymentReview: 'manual', coinSpendingEnabled: false });
   if (path.join('/') === 'health') return json({ ok: true, mode: 'course-demo', storage: 'r2' });
   if (path.join('/') === 'auth') {
     const signedIn = await actor(request);
@@ -322,6 +368,18 @@ async function handle(request) {
   }
   if (path.join('/') === 'orders') return getOrders(request);
   if (path.join('/') === 'staff/orders') return getOrders(request, true);
+  if (path.join('/') === 'wallet') {
+    const signedIn = await actor(request);
+    return signedIn ? json(await walletFor(paymentDb(env), signedIn.id)) : json({ error: '请先登录。' }, 401);
+  }
+  if (path.join('/') === 'payments') {
+    const signedIn = await actor(request);
+    return signedIn ? json({ items: await paymentsFor(paymentDb(env), signedIn.id) }) : json({ error: '请先登录。' }, 401);
+  }
+  if (path.join('/') === 'staff/payments') {
+    const signedIn = await actor(request);
+    return isStaff(request, signedIn) ? json({ items: await paymentsFor(paymentDb(env), signedIn.id, true) }) : json({ error: '没有工作人员权限。' }, 403);
+  }
   if (path.join('/') === 'works') return json(await listWorks(url.searchParams));
   if (path.length === 2 && path[0] === 'works' && /^[a-z0-9-]{6,60}$/.test(path[1])) {
     const work = examples.find(item => item.id === path[1]) || await savedWork(path[1]);
