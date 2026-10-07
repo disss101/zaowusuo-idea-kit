@@ -1,16 +1,24 @@
 import { env } from 'cloudflare:workers';
 import { catalog, normalizeRequest, InputError } from '../../../lib/planner.mjs';
-import { generateAiPlan, AiServiceError } from '../../../lib/ai-design.mjs';
+import { askClarifyingQuestions, generateAiPlan, AiServiceError } from '../../../lib/ai-design.mjs';
 import { examples, exampleCsv } from '../../../lib/examples.mjs';
 import { prepareOrder } from '../../../lib/orders.mjs';
+import { AuthError, login, logout, publicProfile, register, sessionAccount, updatePhone } from '../../../lib/local-auth.mjs';
 
 export const dynamic = 'force-dynamic';
 
 const categories = new Set(['桌面装置', '智能家居', '学习实验', '生活工具', '其他创意']);
 const limits = { upload: 25 * 1024 * 1024, file: 10 * 1024 * 1024 };
 const dailyAiLimit = 10;
-function currentUser(request) { return request.headers.get('oai-authenticated-user-id'); }
-function isStaff(request) {
+const dailyClarifyLimit = 20;
+async function actor(request) {
+  const local = await sessionAccount(bucket(), request);
+  if (local) return { id: `email:${local.account.id}`, mode: 'email', local };
+  const id = request.headers.get('oai-authenticated-user-id');
+  return id ? { id, mode: 'chatgpt' } : null;
+}
+function isStaff(request, signedIn) {
+  if (signedIn?.mode !== 'chatgpt') return false;
   const email = request.headers.get('oai-authenticated-user-email')?.trim().toLowerCase();
   return !!email && !!env.ADMIN_EMAIL && env.ADMIN_EMAIL.split(',').some(item => item.trim().toLowerCase() === email);
 }
@@ -74,8 +82,8 @@ async function listWorks(params) {
   return { items: matching.slice((page - 1) * pageSize, page * pageSize).map(publicWork), page, pageSize, total: matching.length, pages: Math.max(1, Math.ceil(matching.length / pageSize)) };
 }
 async function createWork(request) {
-  const userId = request.headers.get('oai-authenticated-user-id');
-  if (!userId) return json({ error: '发布作品需要先登录。', signIn: '/signin-with-chatgpt?return_to=%2Findex.html' }, 401);
+  const userId = (await actor(request))?.id;
+  if (!userId) return json({ error: '发布作品需要先登录。' }, 401);
   if (!request.headers.get('content-type')?.startsWith('multipart/form-data;')) throw new InputError('请提交作品表单。');
   const contentLength = Number(request.headers.get('content-length') || 0);
   if (contentLength > limits.upload) return json({ error: '上传总大小不能超过 25 MB。' }, 413);
@@ -86,6 +94,8 @@ async function createWork(request) {
   const description = clean(form.get('description'), '制作说明', 20, 5000);
   const category = clean(form.get('category'), '分类', 2, 20);
   if (!categories.has(category)) throw new InputError('作品分类无效。');
+  const unlockPriceCoins = Number(form.get('unlockPriceCoins') ?? 20);
+  if (!Number.isSafeInteger(unlockPriceCoins) || unlockPriceCoins < 0 || unlockPriceCoins > 500) throw new InputError('造物 B 参考解锁价需要为 0–500 的整数。');
   if (form.get('rights') !== 'yes') throw new InputError('请确认你有权分享这些文件。');
   let bom;
   try { bom = JSON.parse(form.get('bom')); } catch { throw new InputError('配件表格式不正确。'); }
@@ -109,7 +119,7 @@ async function createWork(request) {
   }
   const files = prepared.map(({ id, name, size, type, extension }) => ({ id, name, size, type, extension }));
   const coverFileId = files.find(file => file.type.startsWith('image/'))?.id || null;
-  const record = { id, title, author, summary, description, category, bom, files, coverFileId, ownerId: userId, createdAt: new Date().toISOString() };
+  const record = { id, title, author, summary, description, category, bom, files, coverFileId, unlockPriceCoins, ownerId: userId, createdAt: new Date().toISOString() };
   const written = [];
   try {
     for (const file of prepared) {
@@ -141,7 +151,7 @@ async function download(id, section, fileId, request) {
   return new Response(request.method === 'HEAD' ? null : object.body, { headers });
 }
 async function design(input, request) {
-  const userId = currentUser(request);
+  const userId = (await actor(request))?.id;
   if (!userId) return json({ error: '请先登录，再生成 AI 方案。' }, 401);
   if (!env.DEEPSEEK_API_KEY) return json({ error: 'AI 服务尚未配置，请稍后再试。' }, 503);
   const normalized = normalizeRequest(input);
@@ -159,10 +169,25 @@ async function design(input, request) {
   await bucket().put(`${prefix}${crypto.randomUUID()}.json`, JSON.stringify({ at: new Date().toISOString() }), { httpMetadata: { contentType: 'application/json' } });
   return json(result);
 }
+async function clarify(input, request) {
+  const userId = (await actor(request))?.id;
+  if (!userId) return json({ error: '请先登录，再开始 AI 追问。' }, 401);
+  const idea = String(input?.idea || '').trim();
+  if (idea.length < 4 || idea.length > 600) throw new InputError('请用 4–600 字描述你的想法。');
+  const userHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId))), x => x.toString(16).padStart(2, '0')).join('');
+  const date = new Date().toISOString().slice(0, 10);
+  const prefix = `clarify-usage/${userHash}/${date}/`;
+  const usage = await bucket().list({ prefix, limit: dailyClarifyLimit });
+  if (usage.objects.length >= dailyClarifyLimit) return json({ error: '今天的追问次数已用完，明天再来试试。' }, 429);
+  const answer = await askClarifyingQuestions({ idea }, { apiKey: env.DEEPSEEK_API_KEY });
+  await bucket().put(`${prefix}${crypto.randomUUID()}.json`, JSON.stringify({ at: new Date().toISOString() }));
+  return json(answer);
+}
 async function getOrders(request, staff = false) {
-  const userId = currentUser(request);
+  const signedIn = await actor(request);
+  const userId = signedIn?.id;
   if (!userId) return json({ error: '请先登录。' }, 401);
-  if (staff && !isStaff(request)) return json({ error: '没有工作人员权限。' }, 403);
+  if (staff && !isStaff(request, signedIn)) return json({ error: '没有工作人员权限。' }, 403);
   const page = await bucket().list({ prefix: 'orders/', limit: 1000 });
   const records = (await Promise.all(page.objects.map(async object => {
     const stored = await bucket().get(object.key);
@@ -171,14 +196,14 @@ async function getOrders(request, staff = false) {
   return json({ items: records.slice(0, 100), truncated: page.truncated || records.length > 100 });
 }
 async function createOrder(input, request) {
-  const userId = currentUser(request);
+  const userId = (await actor(request))?.id;
   if (!userId) return json({ error: '请先登录，再提交订单需求。' }, 401);
   const order = prepareOrder(input, userId);
   await bucket().put(`orders/${order.id}.json`, JSON.stringify(order), { httpMetadata: { contentType: 'application/json' } });
   return json({ id: order.id, status: order.status, paymentStatus: order.paymentStatus, estimateCny: order.estimateCny }, 201);
 }
 async function updateOrder(id, input, request) {
-  if (!isStaff(request)) return json({ error: '没有工作人员权限。' }, 403);
+  if (!isStaff(request, await actor(request))) return json({ error: '没有工作人员权限。' }, 403);
   if (!/^[a-f0-9-]{36}$/.test(id)) return json({ error: '订单不存在。' }, 404);
   if (!['pending_review', 'reviewing', 'needs_changes', 'closed'].includes(input?.status)) throw new InputError('订单状态无效。');
   const key = `orders/${id}.json`;
@@ -199,7 +224,21 @@ async function handle(request) {
     if (path.join('/') === 'works') return createWork(request);
     if (Number(request.headers.get('content-length') || 0) > 16000) return json({ error: '内容过长。' }, 413);
     const input = await request.json().catch(() => { throw new InputError('请求格式不正确。'); });
+    if (path.join('/') === 'local-auth/register' || path.join('/') === 'local-auth/login') {
+      const result = path[1] === 'register' ? await register(bucket(), input) : await login(bucket(), input);
+      return Response.json({ authenticated: true, ...result.profile, isStaff: false }, { headers: { 'Set-Cookie': result.setCookie, 'Cache-Control': 'no-store' } });
+    }
+    if (path.join('/') === 'local-auth/logout') {
+      const clearCookie = await logout(bucket(), request);
+      return Response.json({ ok: true }, { headers: { 'Set-Cookie': clearCookie, 'Cache-Control': 'no-store' } });
+    }
+    if (path.join('/') === 'local-auth/phone') {
+      const signedIn = await actor(request);
+      if (signedIn?.mode !== 'email') return json({ error: '请先用邮箱账号登录。' }, 401);
+      return json(await updatePhone(bucket(), signedIn.local, input.phone));
+    }
     if (path.join('/') === 'design') return design(input, request);
+    if (path.join('/') === 'clarify') return clarify(input, request);
     if (path.join('/') === 'events') {
       const allowed = ['visit', 'design_start', 'design_complete', 'buy_click', 'feedback'];
       if (!allowed.includes(input.event) || typeof input.session !== 'string' || !/^[\w-]{10,80}$/.test(input.session)) throw new InputError('记录格式不正确。');
@@ -217,15 +256,18 @@ async function handle(request) {
   }
   if (request.method !== 'GET' && request.method !== 'HEAD') return json({ error: '请求方式不支持。' }, 405);
   if (path.join('/') === 'catalog') return json(catalog);
+  if (path.join('/') === 'pricing') return json({ unit: '造物 B', coinsPerYuan: 10, generationPreview: 5, exampleUnlock: 0, communitySuggestedUnlock: 20, transactionsEnabled: false });
   if (path.join('/') === 'health') return json({ ok: true, mode: 'course-demo', storage: 'r2' });
   if (path.join('/') === 'auth') {
-    const authenticated = !!request.headers.get('oai-authenticated-user-id');
+    const signedIn = await actor(request);
+    const authenticated = !!signedIn;
+    if (signedIn?.mode === 'email') return json({ authenticated: true, ...publicProfile(signedIn.local.account), isStaff: false });
     const encoded = request.headers.get('oai-authenticated-user-full-name');
     let displayName = request.headers.get('oai-authenticated-user-email') || '造物玩家';
     if (encoded && request.headers.get('oai-authenticated-user-full-name-encoding') === 'percent-encoded-utf-8') {
       try { displayName = decodeURIComponent(encoded); } catch {}
     }
-    return json({ authenticated, displayName: authenticated ? displayName : null, isStaff: authenticated && isStaff(request) });
+    return json({ authenticated, displayName: authenticated ? displayName : null, isStaff: authenticated && isStaff(request, signedIn), mode: signedIn?.mode || null });
   }
   if (path.join('/') === 'orders') return getOrders(request);
   if (path.join('/') === 'staff/orders') return getOrders(request, true);
@@ -241,6 +283,7 @@ export async function GET(request) { try { return await handle(request); } catch
 export async function HEAD(request) { try { return await handle(request); } catch (error) { return failure(error); } }
 export async function POST(request) { try { return await handle(request); } catch (error) { return failure(error); } }
 function failure(error) {
+  if (error instanceof AuthError) return json({ error: error.message }, error.status);
   if (error instanceof InputError) return json({ error: error.message }, 400);
   if (error instanceof AiServiceError) return json({ error: error.message }, 502);
   console.error(error);
