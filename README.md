@@ -1,6 +1,8 @@
 # 造物所 IDEA KIT · 线上版
 
-这个目录是课程网站的线上部署源码。它沿用 `../idea-kit` 的首页、设计流程和灵感集市视觉；`public/` 中是从该项目构建得到的页面与图片。根路径会跳转到 `/index.html`，集市地址为 `/index.html#/inspiration`。
+这是造物所 IDEA KIT 的网站源码。完整产品运行在 [造物所在线站点](https://zaowusuo-idea-kit.victoriapoter513.chatgpt.site/)；`public/` 包含网站页面和图片，服务端接口位于 `app/api/`。
+
+`docs/` 是 GitHub Pages 的静态入口页，保留首页的品牌封面，并引导访问在线站点。GitHub Pages 不运行本站的登录、AI 生成、数据库或文件存储；这些功能仍由现有在线服务提供。请勿将模型密钥、支付凭据或其他运行时密钥提交到仓库。
 
 线上版使用 Sites 的 Worker 提供 API，并通过 R2 持久保存玩家作品和上传文件。浏览、搜索、下载对访问者开放；发布作品需要先使用 ChatGPT 登录。每件作品可包含配件表及 1–5 个 PDF、PNG、JPG、WebP 或 ZIP 文件，总大小不超过 25 MB。服务器会核验文件内容与扩展名，并将下载以附件形式提供。
 
