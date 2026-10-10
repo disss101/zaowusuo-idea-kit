@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { askClarifyingQuestions, generateAiPlan, guideBuild, inspectBuildImage, AiServiceError, QWEN_ENDPOINT } from '../lib/ai-design.mjs';
+import { askClarifyingQuestions, generateAiPlan, guideBuild, inspectBuildImage, safePlanSteps, AiServiceError, QWEN_ENDPOINT } from '../lib/ai-design.mjs';
+import { normalizeRequest } from '../lib/planner.mjs';
 
 const ideas = [
   ['低成本 LED 夜灯', ['c3', 'rgb', 'usb', 'wires']],
@@ -55,6 +56,16 @@ test('20 个不同创意均通过结构、零件与服务器计价校验', async
     assert.equal(result.total, result.bom.reduce((sum, part) => sum + part.price, 0), idea);
     assert.equal(result.needsReview, true, idea);
   }
+});
+
+test('未明确要求声音时不默认加入蜂鸣器；未经核对的引脚步骤不会展示', async () => {
+  assert.equal(normalizeRequest({ idea: '摸头后显示笑脸的桌宠' }).sound, false);
+  assert.equal(normalizeRequest({ idea: '摸头后发出提示音的桌宠' }).sound, true);
+  const unsafe = mockOutput(['c3', 'touch', 'oled', 'usb', 'wires']);
+  unsafe.assemblySteps = ['核对型号', '断电连接 touch→GPIO4、OLED SDA:21', '接入 3.3V 电源', '测试功能'];
+  const result = await generateAiPlan({ idea: '摸头后显示笑脸的桌宠', budget: 150 }, { apiKey: 'test-only', fetchImpl: reply(unsafe) });
+  assert.deepEqual(result.assemblySteps, safePlanSteps(unsafe.assemblySteps));
+  assert.doesNotMatch(result.assemblySteps.join(' '), /GPIO|3\.3V|SDA/);
 });
 
 test('模型不能添加库外零件或缺少驱动、主控', async () => {

@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { catalog, normalizeRequest, InputError } from '../../../lib/planner.mjs';
-import { askClarifyingQuestions, generateAiPlan, guideBuild, inspectBuildImage, AiServiceError } from '../../../lib/ai-design.mjs';
+import { askClarifyingQuestions, generateAiPlan, guideBuild, inspectBuildImage, safePlanSteps, AiServiceError } from '../../../lib/ai-design.mjs';
 import { examples, exampleCsv } from '../../../lib/examples.mjs';
 import { prepareOrder } from '../../../lib/orders.mjs';
 import { paymentDb, walletFor, paymentsFor, paymentFor, createTopup, createOrderPayment, submitTransfer, reviewTransfer } from '../../../lib/payments.mjs';
@@ -28,7 +28,10 @@ async function logAiCall({ userHash, projectId = null, task, model, usage = null
 async function projectFor(userHash, id) {
   if (!/^[a-f0-9-]{36}$/.test(id || '')) return null;
   const stored = await bucket().get(`ai-projects/${userHash}/${id}.json`);
-  return stored ? stored.json() : null;
+  if (!stored) return null;
+  const project = await stored.json();
+  if (project?.plan?.supported) project.plan.assemblySteps = safePlanSteps(project.plan.assemblySteps);
+  return project;
 }
 async function saveProject(userHash, project) {
   await bucket().put(`ai-projects/${userHash}/${project.id}.json`, JSON.stringify(project), { httpMetadata: { contentType: 'application/json' } });
@@ -228,7 +231,7 @@ async function design(input, request) {
   if (!env.QWEN_API_KEY) return json({ error: 'AI 服务尚未配置，请稍后再试。' }, 503);
   const normalized = normalizeRequest(input);
   const userHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId))), x => x.toString(16).padStart(2, '0')).join('');
-  const requestHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({ version: 3, normalized })))), x => x.toString(16).padStart(2, '0')).join('');
+  const requestHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({ version: 4, normalized })))), x => x.toString(16).padStart(2, '0')).join('');
   const cacheKey = `ai-cache/${userHash}/${requestHash}.json`;
   const cached = await bucket().get(cacheKey);
   if (cached) return json(await cached.json());
