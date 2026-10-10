@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { askClarifyingQuestions, generateAiPlan, guideBuild, inspectBuildImage, safePlanSteps, AiServiceError, QWEN_ENDPOINT } from '../lib/ai-design.mjs';
+import { askClarifyingQuestions, generateAiPlan, presetFallbackPlan, guideBuild, inspectBuildImage, safePlanSteps, AiServiceError, QWEN_ENDPOINT } from '../lib/ai-design.mjs';
 import { normalizeRequest } from '../lib/planner.mjs';
 
 const ideas = [
@@ -79,6 +79,16 @@ test('预算不足仍保留方案，API 故障与不可行分开呈现', async (
   assert.equal(plan.withinBudget, false);
   assert.match(plan.notes.join(' '), /预算/);
   await assert.rejects(generateAiPlan({ idea: '做一个移动机器人', budget: 200 }, { apiKey: 'test-only', fetchImpl: reply(null, () => {}, 503) }), /暂时不可用/);
+});
+
+test('AI 服务失败时只为已有灵感提供清楚标识的参考方案', () => {
+  const fallback = presetFallbackPlan({ idea: '做一只摸头会显示表情的桌宠', budget: 150 });
+  assert.equal(fallback.supported, true);
+  assert.equal(fallback.source, 'preset-fallback');
+  assert.match(fallback.status, /AI 暂不可用/);
+  assert.match(fallback.notes[0], /并非专属 AI 设计/);
+  assert.deepEqual(fallback.assemblySteps, safePlanSteps());
+  assert.equal(presetFallbackPlan({ idea: '制作一个前所未见的未知装置', budget: 150 }), null);
 });
 
 test('制作导师使用项目清单与当前步骤，不编造接线', async () => {

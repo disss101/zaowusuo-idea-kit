@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { catalog, normalizeRequest, InputError } from '../../../lib/planner.mjs';
-import { askClarifyingQuestions, generateAiPlan, guideBuild, inspectBuildImage, safePlanSteps, AiServiceError } from '../../../lib/ai-design.mjs';
+import { askClarifyingQuestions, generateAiPlan, presetFallbackPlan, guideBuild, inspectBuildImage, safePlanSteps, AiServiceError } from '../../../lib/ai-design.mjs';
 import { examples, exampleCsv } from '../../../lib/examples.mjs';
 import { prepareOrder } from '../../../lib/orders.mjs';
 import { paymentDb, walletFor, paymentsFor, paymentFor, createTopup, createOrderPayment, submitTransfer, reviewTransfer } from '../../../lib/payments.mjs';
@@ -249,20 +249,38 @@ async function design(input, request) {
   const startedAt = Date.now();
   let result;
   let metering;
+  let resolvedModel = model;
   try {
     result = await generateAiPlan(normalized, { apiKey: env.QWEN_API_KEY, model, endpoint: env.QWEN_API_ENDPOINT || undefined,
       onUsage: info => { metering = info; },
     });
-    await logAiCall({ userHash, projectId, task: 'generatePlan', model: metering?.model || model, usage: metering?.usage, startedAt });
   } catch (error) {
     await logAiCall({ userHash, projectId, task: 'generatePlan', model: metering?.model || model, usage: metering?.usage, startedAt, error }).catch(() => {});
-    throw error;
+    if (!(error instanceof AiServiceError)) throw error;
+    console.warn('AI plan generation failed', { model, reason: error.message });
+    const fastModel = env.QWEN_FAST_MODEL || 'qwen-flash';
+    if (fastModel !== model) {
+      const retryStartedAt = Date.now();
+      try {
+        metering = null;
+        result = await generateAiPlan(normalized, { apiKey: env.QWEN_API_KEY, model: fastModel, endpoint: env.QWEN_API_ENDPOINT || undefined,
+          timeoutMs: 25000, onUsage: info => { metering = info; },
+        });
+        resolvedModel = fastModel;
+      } catch (retryError) {
+        console.warn('AI plan retry failed', { model: fastModel, reason: retryError.message });
+        await logAiCall({ userHash, projectId, task: 'generatePlanRetry', model: fastModel, startedAt: retryStartedAt, error: retryError }).catch(() => {});
+      }
+    }
+    if (!result) result = presetFallbackPlan(normalized);
+    if (!result) throw error;
   }
+  if (result.source === 'qwen') await logAiCall({ userHash, projectId, task: 'generatePlan', model: metering?.model || resolvedModel, usage: metering?.usage, startedAt }).catch(() => {});
   if (result.supported) {
     result.projectId = projectId;
     await saveProject(userHash, { id: projectId, ownerId: userId, plan: result, step: 0, history: [], verifiedWiring: null, firmwareVersion: null, status: '待工程验证', createdAt: new Date().toISOString() });
   }
-  await bucket().put(cacheKey, JSON.stringify(result), { httpMetadata: { contentType: 'application/json' } });
+  if (result.source === 'qwen') await bucket().put(cacheKey, JSON.stringify(result), { httpMetadata: { contentType: 'application/json' } });
   await bucket().put(`${prefix}${crypto.randomUUID()}.json`, JSON.stringify({ at: new Date().toISOString() }), { httpMetadata: { contentType: 'application/json' } });
   return json(result);
 }
