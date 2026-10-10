@@ -7,6 +7,10 @@ const publicDir = new URL('../public/', import.meta.url).pathname.replace(/^\/(?
 const docsDir = new URL('../docs/', import.meta.url).pathname.replace(/^\/(?=[A-Za-z]:\/)/, '');
 const assetsDir = join(docsDir, 'assets');
 const sourceAssetsDir = join(publicDir, 'assets');
+// Match the asset pair currently loaded by the published Site. Its checked-in
+// public/index.html still references an older pair retained in public/assets.
+const liveScript = 'index-Dn1eS_8t.js';
+const liveStyles = 'index-BiBRtw0X.css';
 
 for (const name of readdirSync(docsDir)) {
   if (name === '.nojekyll' || name.endsWith('.md')) continue;
@@ -21,7 +25,7 @@ for (const name of readdirSync(publicDir)) {
 for (const name of readdirSync(sourceAssetsDir)) {
   // Old hashed builds are retained in the hosted checkout, but unused by the
   // current index.html. Ship the active pair and every image it references.
-  if (name.startsWith('index-') && !['index-wc-_j_N9.js', 'index-lwqwHeId.css'].includes(name)) continue;
+  if (name.startsWith('index-') && ![liveScript, liveStyles].includes(name)) continue;
   copyFileSync(join(sourceAssetsDir, name), join(assetsDir, name));
 }
 
@@ -36,11 +40,13 @@ rewrite('index.html', source => source
   .replaceAll('src="/app.js"', 'src="./app.js"')
   .replaceAll('src="/assets/', 'src="./assets/')
   .replaceAll('href="/assets/', 'href="./assets/')
+  .replace('index-wc-_j_N9.js', liveScript)
+  .replace('index-lwqwHeId.css', liveStyles)
   .replace('  <script type="module" src="./app.js"></script>', '  <script src="./pages-bridge.js"></script>\n  <script type="module" src="./app.js"></script>'));
 rewrite('styles.css', source => source.replaceAll('/assets/', './assets/'));
 rewrite('app.js', source => source.replaceAll('/assets/', './assets/'));
-rewrite('assets/index-lwqwHeId.css', source => source.replaceAll('/assets/', './'));
-rewrite('assets/index-wc-_j_N9.js', source => source
+rewrite(`assets/${liveStyles}`, source => source.replaceAll('/assets/', './'));
+rewrite(`assets/${liveScript}`, source => source
   .replaceAll('/assets/', './assets/')
   .replace('c.createElement("a",{className:"account-secondary",href:R},c.createElement(Bv,{size:15})," 使用 ChatGPT 登录"),', ''));
 writeFileSync(join(docsDir, 'pages-bridge.js'), readFileSync(new URL('./pages-bridge.js', import.meta.url)));
