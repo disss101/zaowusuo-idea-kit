@@ -91,3 +91,12 @@ test('AI usage retains a searchable owner link, and invalid support input return
   assert.equal(failed.status,400);
   assert.match((await failed.json()).error,/问题描述/);
 });
+
+test('table sorting happens before pagination',async()=>{
+  const f=fixture();
+  for (const [sku,name] of [['PART-A','甲零件'],['PART-B','乙零件']]) await call(f,'components',{body:{sku,name,costFen:100,priceFen:200}});
+  const result=await adminRequest(f.env,request('admin/components?sort=sku&direction=desc&pageSize=1'),['components']);
+  const data=await result.json();
+  assert.equal(data.items[0].sku,'PART-B');
+  assert.equal(data.total,2);
+});

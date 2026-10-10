@@ -48,6 +48,8 @@ export default function AdminConsole() {
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('');
   const [page, setPage] = useState(1);
+  const [sort, setSort] = useState('');
+  const [direction, setDirection] = useState<'asc'|'desc'>('asc');
   const [days, setDays] = useState(1);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
@@ -60,14 +62,14 @@ export default function AdminConsole() {
   const refresh = useCallback(async () => {
     if (!me || !me.permissions[section === 'ai-logs' ? 'ai_logs' : section === 'payments' ? 'finance' : section]) return;
     setLoading(true); setError('');
-    try { const params = new URLSearchParams({ page: String(page), pageSize: '20', q: query, ...(filter ? { status: filter } : {}), ...(section === 'overview' ? { days: String(days) } : {}) }); setData(await api(`${section}?${params}`)); }
+    try { const params = new URLSearchParams({ page: String(page), pageSize: '20', q: query, ...(filter ? { status: filter } : {}), ...(sort ? { sort, direction } : {}), ...(section === 'overview' ? { days: String(days) } : {}) }); setData(await api(`${section}?${params}`)); }
     catch (cause: any) { setError(cause.message); setData(null); }
     finally { setLoading(false); }
-  }, [me, section, page, query, filter, days]);
+  }, [me, section, page, query, filter, days, sort, direction]);
 
   useEffect(() => { api('me').then(setMe).catch((cause: any) => setError(cause.message)); }, []);
   useEffect(() => { if (me) refresh(); }, [me, refresh]);
-  useEffect(() => { setSelected(null); setSelectedId(''); setPage(1); setQuery(''); setFilter(''); setMenuOpen(false); }, [section]);
+  useEffect(() => { setSelected(null); setSelectedId(''); setPage(1); setQuery(''); setFilter(''); setSort(''); setDirection('asc'); setMenuOpen(false); }, [section]);
 
   async function openDetail(id: string) {
     setSelectedId(id); setDetailLoading(true); setError('');
@@ -98,7 +100,7 @@ export default function AdminConsole() {
           {section === 'overview' && data && <><div className="admin-range">{[1,7,30].map(n => <button key={n} className={days === n ? 'active' : ''} onClick={() => setDays(n)}>{n === 1 ? '今日' : `近 ${n} 天`}</button>)}</div><div className="admin-metrics">{[
             ['订单数',data.metrics.orders],['人工确认销售额',money(data.metrics.confirmedSalesFen)],['待处理订单',data.metrics.pendingOrders],['待审核方案',data.metrics.pendingPlans],['未结工单',data.metrics.openTickets],['库存预警',data.metrics.lowStock],['AI 调用',data.metrics.aiCalls],['AI 费用估算',`¥${data.metrics.estimatedAiCostCny}`],['项目最终步骤',`${data.metrics.completedProjects} / ${data.metrics.totalProjects}`],
           ].map(([label,value]) => <div className="admin-metric" key={String(label)}><span>{label}</span><strong>{value}</strong></div>)}</div><h2 className="admin-subtitle">待办事项</h2><div className="admin-todos">{(['plans','orders','tickets','components'] as const).map(key => <div key={key}><h3>{sections.find(item => item.id === key)?.label}</h3>{data!.todos[key]?.length ? data!.todos[key].map((item: RecordData) => <button key={item.id} onClick={() => { setSection(key); api(`${key}/${item.id}`).then(detail => { setSelectedId(item.id); setSelected(detail); setDraft(detail); }).catch(cause => setError(cause.message)); }}>{item.name}<span>↗</span></button>) : <p>目前没有待办</p>}</div>)}</div>{data.truncated && <p className="admin-hint">记录较多，此视图仅展示前 5000 条；进一步分析需接入聚合表。</p>}</>}
-          {section !== 'overview' && <><div className="admin-tools"><input aria-label="搜索" value={query} onChange={event => { setQuery(event.target.value); setPage(1); }} placeholder="搜索编号、名称或关键词" />{filterStatuses[section] && <select aria-label="按状态筛选" value={filter} onChange={event => { setFilter(event.target.value); setPage(1); }}><option value="">全部状态</option>{filterStatuses[section].map(key => <option key={key} value={key}>{statusNames[key]}</option>)}</select>}<span>{data?.total ?? data?.items?.length ?? 0} 条记录</span></div><div className="admin-table-wrap"><table className="admin-table"><thead><tr>{columns(section).map(column => <th key={column.key}>{column.label}</th>)}<th>操作</th></tr></thead><tbody>{(data?.items || []).map((item: RecordData, index: number) => <tr key={item.id || item.sku || item.email || index}>{columns(section).map(column => <td key={column.key}>{renderCell(item,column.key)}</td>)}<td><button className="admin-link" onClick={() => openDetail(String(item.id || item.sku || item.email || index))}>{['ai-logs','audit','employees','payments'].includes(section) ? '查看' : '查看 / 处理'} →</button></td></tr>)}</tbody></table>{!data?.items?.length && <div className="admin-empty">还没有记录。{section === 'tickets' ? '用户提交人工支持后会出现在这里。' : ''}</div>}</div>{data?.pages > 1 && <div className="admin-pagination"><button disabled={page <= 1} onClick={() => setPage(page - 1)}>上一页</button><span>第 {page} / {data!.pages} 页</span><button disabled={page >= data!.pages} onClick={() => setPage(page + 1)}>下一页</button></div>}{data?.truncated && <p className="admin-hint">当前列表达到 5000 条读取上限。</p>}</>}
+          {section !== 'overview' && <><div className="admin-tools"><input aria-label="搜索" value={query} onChange={event => { setQuery(event.target.value); setPage(1); }} placeholder="搜索编号、名称或关键词" />{filterStatuses[section] && <select aria-label="按状态筛选" value={filter} onChange={event => { setFilter(event.target.value); setPage(1); }}><option value="">全部状态</option>{filterStatuses[section].map(key => <option key={key} value={key}>{statusNames[key]}</option>)}</select>}<span>{data?.total ?? data?.items?.length ?? 0} 条记录</span></div><div className="admin-table-wrap"><table className="admin-table"><thead><tr>{columns(section).map(column => <th key={column.key}><button className="admin-sort" onClick={() => { setPage(1); setDirection(sort === column.key && direction === 'asc' ? 'desc' : 'asc'); setSort(column.key); }} aria-label={`${column.label}排序`}>{column.label}{sort === column.key ? (direction === 'asc' ? ' ↑' : ' ↓') : ''}</button></th>)}<th>操作</th></tr></thead><tbody>{(data?.items || []).map((item: RecordData, index: number) => <tr key={item.id || item.sku || item.email || index}>{columns(section).map(column => <td key={column.key}>{renderCell(item,column.key)}</td>)}<td><button className="admin-link" onClick={() => openDetail(String(item.id || item.sku || item.email || index))}>{['ai-logs','audit','employees','payments'].includes(section) ? '查看' : '查看 / 处理'} →</button></td></tr>)}</tbody></table>{!data?.items?.length && <div className="admin-empty">还没有记录。{section === 'tickets' ? '用户提交人工支持后会出现在这里。' : ''}</div>}</div>{data?.pages > 1 && <div className="admin-pagination"><button disabled={page <= 1} onClick={() => setPage(page - 1)}>上一页</button><span>第 {page} / {data!.pages} 页</span><button disabled={page >= data!.pages} onClick={() => setPage(page + 1)}>下一页</button></div>}{data?.truncated && <p className="admin-hint">当前列表达到 5000 条读取上限。</p>}</>}
         </>}
       </main>
     </div>
