@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:workers';
 import { catalog, normalizeRequest, InputError } from '../../../lib/planner.mjs';
-import { askClarifyingQuestions, generateAiPlan, AiServiceError } from '../../../lib/ai-design.mjs';
+import { askClarifyingQuestions, generateAiPlan, guideBuild, inspectBuildImage, AiServiceError } from '../../../lib/ai-design.mjs';
 import { examples, exampleCsv } from '../../../lib/examples.mjs';
 import { prepareOrder } from '../../../lib/orders.mjs';
 import { paymentDb, walletFor, paymentsFor, paymentFor, createTopup, createOrderPayment, submitTransfer, reviewTransfer } from '../../../lib/payments.mjs';
@@ -12,6 +12,27 @@ const categories = new Set(['桌面装置', '智能家居', '学习实验', '生
 const limits = { upload: 25 * 1024 * 1024, file: 10 * 1024 * 1024 };
 const dailyAiLimit = 10;
 const dailyClarifyLimit = 20;
+const dailyGuideLimit = 20;
+function tokenCost(model, usage) {
+  const rates = model?.startsWith('qwen-plus') ? [0.8, 2] : model?.startsWith('qwen-flash') || model?.startsWith('qwen3-vl-flash') ? [0.15, 1.5] : null;
+  return rates && Number.isFinite(usage?.prompt_tokens) && Number.isFinite(usage?.completion_tokens)
+    ? Number(((usage.prompt_tokens * rates[0] + usage.completion_tokens * rates[1]) / 1_000_000).toFixed(6)) : null;
+}
+async function logAiCall({ userHash, projectId = null, task, model, usage = null, startedAt, error = null }) {
+  const date = new Date().toISOString().slice(0, 10);
+  const record = { at: new Date().toISOString(), projectId, task, model, inputTokens: usage?.prompt_tokens ?? null,
+    outputTokens: usage?.completion_tokens ?? null, estimatedCostCny: tokenCost(model, usage), durationMs: Date.now() - startedAt,
+    success: !error, errorType: error?.name || null };
+  await bucket().put(`ai-model-usage/${userHash}/${date}/${crypto.randomUUID()}.json`, JSON.stringify(record));
+}
+async function projectFor(userHash, id) {
+  if (!/^[a-f0-9-]{36}$/.test(id || '')) return null;
+  const stored = await bucket().get(`ai-projects/${userHash}/${id}.json`);
+  return stored ? stored.json() : null;
+}
+async function saveProject(userHash, project) {
+  await bucket().put(`ai-projects/${userHash}/${project.id}.json`, JSON.stringify(project), { httpMetadata: { contentType: 'application/json' } });
+}
 async function actor(request) {
   const local = await sessionAccount(bucket(), request);
   if (local) return { id: `email:${local.account.id}`, mode: 'email', local };
@@ -204,10 +225,10 @@ async function download(id, section, fileId, request) {
 async function design(input, request) {
   const userId = (await actor(request))?.id;
   if (!userId) return json({ error: '请先登录，再生成 AI 方案。' }, 401);
-  if (!env.DEEPSEEK_API_KEY) return json({ error: 'AI 服务尚未配置，请稍后再试。' }, 503);
+  if (!env.QWEN_API_KEY) return json({ error: 'AI 服务尚未配置，请稍后再试。' }, 503);
   const normalized = normalizeRequest(input);
   const userHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId))), x => x.toString(16).padStart(2, '0')).join('');
-  const requestHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({ version: 2, normalized })))), x => x.toString(16).padStart(2, '0')).join('');
+  const requestHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify({ version: 3, normalized })))), x => x.toString(16).padStart(2, '0')).join('');
   const cacheKey = `ai-cache/${userHash}/${requestHash}.json`;
   const cached = await bucket().get(cacheKey);
   if (cached) return json(await cached.json());
@@ -215,7 +236,24 @@ async function design(input, request) {
   const prefix = `ai-usage/${userHash}/${date}/`;
   const usage = await bucket().list({ prefix, limit: dailyAiLimit });
   if (usage.objects.length >= dailyAiLimit) return json({ error: '今天的 AI 生成次数已用完，明天再来试试。' }, 429);
-  const result = await generateAiPlan(normalized, { apiKey: env.DEEPSEEK_API_KEY });
+  const projectId = crypto.randomUUID();
+  const model = env.QWEN_PLAN_MODEL || 'qwen-plus';
+  const startedAt = Date.now();
+  let result;
+  let metering;
+  try {
+    result = await generateAiPlan(normalized, { apiKey: env.QWEN_API_KEY, model, endpoint: env.QWEN_API_ENDPOINT || undefined,
+      onUsage: info => { metering = info; },
+    });
+    await logAiCall({ userHash, projectId, task: 'generatePlan', model: metering?.model || model, usage: metering?.usage, startedAt });
+  } catch (error) {
+    await logAiCall({ userHash, projectId, task: 'generatePlan', model: metering?.model || model, usage: metering?.usage, startedAt, error }).catch(() => {});
+    throw error;
+  }
+  if (result.supported) {
+    result.projectId = projectId;
+    await saveProject(userHash, { id: projectId, ownerId: userId, plan: result, step: 0, history: [], verifiedWiring: null, firmwareVersion: null, status: '待工程验证', createdAt: new Date().toISOString() });
+  }
   await bucket().put(cacheKey, JSON.stringify(result), { httpMetadata: { contentType: 'application/json' } });
   await bucket().put(`${prefix}${crypto.randomUUID()}.json`, JSON.stringify({ at: new Date().toISOString() }), { httpMetadata: { contentType: 'application/json' } });
   return json(result);
@@ -225,14 +263,65 @@ async function clarify(input, request) {
   if (!userId) return json({ error: '请先登录，再开始 AI 追问。' }, 401);
   const idea = String(input?.idea || '').trim();
   if (idea.length < 4 || idea.length > 600) throw new InputError('请用 4–600 字描述你的想法。');
+  if (!env.QWEN_API_KEY) return json({ error: 'AI 服务尚未配置，请稍后再试。' }, 503);
   const userHash = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(userId))), x => x.toString(16).padStart(2, '0')).join('');
   const date = new Date().toISOString().slice(0, 10);
   const prefix = `clarify-usage/${userHash}/${date}/`;
   const usage = await bucket().list({ prefix, limit: dailyClarifyLimit });
   if (usage.objects.length >= dailyClarifyLimit) return json({ error: '今天的追问次数已用完，明天再来试试。' }, 429);
-  const answer = await askClarifyingQuestions({ idea }, { apiKey: env.DEEPSEEK_API_KEY });
+  const model = env.QWEN_FAST_MODEL || 'qwen-flash';
+  const startedAt = Date.now();
+  let answer;
+  let metering;
+  try {
+    answer = await askClarifyingQuestions({ idea }, { apiKey: env.QWEN_API_KEY, model, endpoint: env.QWEN_API_ENDPOINT || undefined, onUsage: info => { metering = info; } });
+    await logAiCall({ userHash, task: 'analyzeIdea', model: metering?.model || model, usage: metering?.usage, startedAt });
+  } catch (error) {
+    await logAiCall({ userHash, task: 'analyzeIdea', model: metering?.model || model, usage: metering?.usage, startedAt, error }).catch(() => {});
+    throw error;
+  }
   await bucket().put(`${prefix}${crypto.randomUUID()}.json`, JSON.stringify({ at: new Date().toISOString() }));
   return json(answer);
+}
+async function projectAction(path, input, request) {
+  const signedIn = await actor(request);
+  if (!signedIn) return json({ error: '请先登录。' }, 401);
+  const userHash = await actorKey(signedIn.id);
+  const id = path[1];
+  const project = await projectFor(userHash, id);
+  if (!project || project.ownerId !== signedIn.id) return json({ error: '项目不存在。' }, 404);
+  if (path[2] === 'progress') {
+    const step = Number(input?.step);
+    if (!Number.isInteger(step) || step < 0 || step >= (project.plan.assemblySteps?.length || 4)) throw new InputError('制作步骤无效。');
+    project.step = step;
+    await saveProject(userHash, project);
+    return json({ id, step });
+  }
+  if (!['guide', 'inspect'].includes(path[2])) return json({ error: '接口不存在。' }, 404);
+  if (!env.QWEN_API_KEY) return json({ error: 'AI 服务尚未配置，请稍后再试。' }, 503);
+  const today = new Date().toISOString().slice(0, 10);
+  const prefix = `ai-usage/${userHash}/${today}/guide/`;
+  if ((await bucket().list({ prefix, limit: dailyGuideLimit })).objects.length >= dailyGuideLimit) return json({ error: '今天的项目指导额度已用完，明天再来试试。' }, 429);
+  const complex = /编译|报错|烧录|代码|程序|供电|电压|短路|发热|电机|驱动|GPIO|I2C|SPI/i.test(String(input?.question || ''));
+  const model = path[2] === 'inspect' ? (env.QWEN_VISION_MODEL || 'qwen3-vl-flash') : complex ? (env.QWEN_PLAN_MODEL || 'qwen-plus') : (env.QWEN_FAST_MODEL || 'qwen-flash');
+  const startedAt = Date.now();
+  let metering;
+  try {
+    const settings = { apiKey: env.QWEN_API_KEY, model, endpoint: env.QWEN_API_ENDPOINT || undefined, onUsage: info => { metering = info; } };
+    const answer = path[2] === 'inspect'
+      ? await inspectBuildImage(project, input?.imageDataUrl, input?.question, settings)
+      : await guideBuild(project, input?.question, settings);
+    await logAiCall({ userHash, projectId: id, task: path[2] === 'inspect' ? 'inspectImage' : 'guideBuild', model: metering?.model || model, usage: metering?.usage, startedAt });
+    await bucket().put(`${prefix}${crypto.randomUUID()}.json`, JSON.stringify({ at: new Date().toISOString(), projectId: id }));
+    if (path[2] === 'guide') {
+      project.history = [...(project.history || []), { question: String(input.question).slice(0, 800), actions: answer.actions, at: new Date().toISOString() }].slice(-20);
+      await saveProject(userHash, project);
+    }
+    return json(answer);
+  } catch (error) {
+    await logAiCall({ userHash, projectId: id, task: path[2] === 'inspect' ? 'inspectImage' : 'guideBuild', model: metering?.model || model, usage: metering?.usage, startedAt, error }).catch(() => {});
+    throw error;
+  }
 }
 async function getOrders(request, staff = false) {
   const signedIn = await actor(request);
@@ -316,7 +405,8 @@ async function handle(request) {
     const origin = request.headers.get('origin');
     if (origin && origin !== url.origin) return json({ error: '请求来源不匹配。' }, 403);
     if (path.join('/') === 'works') return createWork(request);
-    if (Number(request.headers.get('content-length') || 0) > 16000) return json({ error: '内容过长。' }, 413);
+    const bodyLimit = path.length === 3 && path[0] === 'projects' && path[2] === 'inspect' ? 4_100_000 : 16000;
+    if (Number(request.headers.get('content-length') || 0) > bodyLimit) return json({ error: '内容过长。' }, 413);
     const input = await request.json().catch(() => { throw new InputError('请求格式不正确。'); });
     if (path.join('/') === 'local-auth/register' || path.join('/') === 'local-auth/login') {
       const result = path[1] === 'register' ? await register(bucket(), input) : await login(bucket(), input);
@@ -332,6 +422,7 @@ async function handle(request) {
       return json(await updatePhone(bucket(), signedIn.local, input.phone));
     }
     if (path.join('/') === 'design') return design(input, request);
+    if (path.length === 3 && path[0] === 'projects') return projectAction(path, input, request);
     if (path.length === 3 && path[0] === 'works' && path[2] === 'engagement') return setEngagement(path[1], input.kind, input.active, request);
     if (path.join('/') === 'clarify') return clarify(input, request);
     if (path.join('/') === 'events') {
@@ -353,6 +444,21 @@ async function handle(request) {
   }
   if (request.method !== 'GET' && request.method !== 'HEAD') return json({ error: '请求方式不支持。' }, 405);
   if (path.join('/') === 'catalog') return json(catalog);
+  if (path[0] === 'projects') {
+    const signedIn = await actor(request);
+    if (!signedIn) return json({ error: '请先登录。' }, 401);
+    const userHash = await actorKey(signedIn.id);
+    if (path.length === 2) {
+      const project = await projectFor(userHash, path[1]);
+      return project?.ownerId === signedIn.id ? json(project) : json({ error: '项目不存在。' }, 404);
+    }
+    if (path.length === 1) {
+      const page = await bucket().list({ prefix: `ai-projects/${userHash}/`, limit: 100 });
+      const projects = (await Promise.all(page.objects.map(async item => (await bucket().get(item.key))?.json()))).filter(Boolean)
+        .filter(item => item.ownerId === signedIn.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+      return json({ items: projects.map(({ id, plan, step, status, createdAt }) => ({ id, name: plan.name, desc: plan.desc, step, status, createdAt })), truncated: page.truncated });
+    }
+  }
   if (path.join('/') === 'pricing') return json({ unit: '造物币', coinsPerYuan: 10, generationPreview: 5, exampleUnlock: 0, communitySuggestedUnlock: 20, paymentReview: 'manual', coinSpendingEnabled: false });
   if (path.join('/') === 'health') return json({ ok: true, mode: 'course-demo', storage: 'r2' });
   if (path.join('/') === 'auth') {
