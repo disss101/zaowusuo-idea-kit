@@ -46,9 +46,14 @@ rewrite('index.html', source => source
 rewrite('styles.css', source => source.replaceAll('/assets/', './assets/'));
 rewrite('app.js', source => source.replaceAll('/assets/', './assets/'));
 rewrite(`assets/${liveStyles}`, source => source.replaceAll('/assets/', './'));
-rewrite(`assets/${liveScript}`, source => source
-  .replaceAll('/assets/', './assets/')
-  .replace('c.createElement("a",{className:"account-secondary",href:R},c.createElement(Bv,{size:15})," 使用 ChatGPT 登录"),', ''));
+rewrite(`assets/${liveScript}`, source => {
+  const withoutChatGptSignIn = source.replace(
+    /c\.createElement\("a",\{className:"account-secondary",href:[A-Za-z]+\},c\.createElement\(Bv,\{size:15\}\)," 使用 ChatGPT 登录"\),/,
+    '',
+  );
+  if (withoutChatGptSignIn === source) throw new Error('Expected customer ChatGPT login link was not found in the active bundle.');
+  return withoutChatGptSignIn.replaceAll('/assets/', './assets/');
+});
 writeFileSync(join(docsDir, 'pages-bridge.js'), readFileSync(new URL('./pages-bridge.js', import.meta.url)));
 writeFileSync(join(docsDir, '.nojekyll'), '');
 console.log('GitHub Pages mirror built from the current hosted public assets.');
