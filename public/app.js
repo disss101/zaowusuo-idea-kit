@@ -45,6 +45,39 @@ async function loadSavedProjects(){
     host.innerHTML=data.items.length?`<h2>已保存的方案</h2>${data.items.map(item=>`<article class="saved-project"><div><strong>${safe(item.name)}</strong><p>${safe(item.desc)} · ${safe(item.status)}</p></div><a href="#/guide/${safe(item.id)}" class="secondary">继续制作与提问 →</a></article>`).join('')}`:'<p>还没有保存在账号中的方案。</p>';
   }catch(error){host.textContent=error.message;}
 }
+
+// A signed-in maker can ask a person for help when AI guidance is insufficient.
+const supportObserver = new MutationObserver(() => {
+  const guideForm = document.querySelector('#guide-form');
+  if (!guideForm || document.querySelector('#support-request')) return;
+  const projectId = guideForm.dataset.project;
+  const panel = document.createElement('section');
+  panel.id = 'support-request';
+  panel.className = 'support-request';
+  panel.innerHTML = `<p class="eyebrow">HUMAN SUPPORT</p><h2>需要人工帮忙？</h2><p>如果反复排查仍无法解决，或出现发热、异味、短路迹象，请先断电，再把问题交给工作人员。</p><form id="support-form" data-project="${safe(projectId)}"><label for="support-description">遇到的情况</label><textarea id="support-description" name="description" minlength="10" maxlength="2000" required placeholder="写下当前步骤、看到的现象，以及已经尝试过什么。"></textarea><button class="secondary" type="submit">提交人工支持请求 →</button></form><p id="support-feedback" role="status"></p><div id="support-history"></div>`;
+  document.querySelector('.guide-layout')?.after(panel);
+  fetch('/api/support').then(response => response.json()).then(data => {
+    const history = panel.querySelector('#support-history');
+    const items = (data.items || []).filter(item => item.project_id === projectId);
+    if (history && items.length) history.innerHTML = `<h3>这个项目的工单</h3>${items.map(item => `<div class="support-ticket"><strong>${safe(item.status)} · ${safe(item.id.slice(0,8))}</strong><p>${safe(item.description)}</p>${item.public_reply ? `<p><b>工作人员回复：</b>${safe(item.public_reply)}</p>` : ''}</div>`).join('')}`;
+  }).catch(() => {});
+});
+supportObserver.observe(main, { childList: true });
+document.addEventListener('submit', async event => {
+  const form = event.target;
+  if (form.id !== 'support-form') return;
+  event.preventDefault();
+  const button = form.querySelector('button');
+  const feedback = document.querySelector('#support-feedback');
+  button.disabled = true;
+  feedback.textContent = '正在提交…';
+  try {
+    const result = await api('/api/support', { projectId: form.dataset.project, description: form.elements.namedItem('description').value });
+    feedback.textContent = `已提交工单 ${result.id.slice(0,8)}。工作人员处理后会在这里回复。`;
+    form.reset();
+  } catch (error) { feedback.textContent = error.message; }
+  finally { button.disabled = false; }
+});
 async function guidePage(id){
   main.innerHTML=`<div class="page">${pageHeading('BUILD GUIDE','一步一步，把它造出来。','根据你保存的方案提问；接线与供电仍需按实际零件核对。')}<p role="status">正在读取项目…</p></div>`;
   try{const response=await fetch(`/api/projects/${encodeURIComponent(id)}`);const project=await response.json();if(!response.ok)throw Error(project.error||'项目读取失败。');

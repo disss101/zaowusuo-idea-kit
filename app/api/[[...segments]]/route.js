@@ -5,6 +5,7 @@ import { examples, exampleCsv } from '../../../lib/examples.mjs';
 import { prepareOrder } from '../../../lib/orders.mjs';
 import { paymentDb, walletFor, paymentsFor, paymentFor, createTopup, createOrderPayment, submitTransfer, reviewTransfer } from '../../../lib/payments.mjs';
 import { AuthError, login, logout, publicProfile, register, sessionAccount, updatePhone } from '../../../lib/local-auth.mjs';
+import { applyReview } from '../../../lib/admin-core.mjs';
 
 export const dynamic = 'force-dynamic';
 
@@ -29,7 +30,11 @@ async function projectFor(userHash, id) {
   if (!/^[a-f0-9-]{36}$/.test(id || '')) return null;
   const stored = await bucket().get(`ai-projects/${userHash}/${id}.json`);
   if (!stored) return null;
-  const project = await stored.json();
+  let project = await stored.json();
+  if (env.DB) {
+    const review = await env.DB.prepare('SELECT * FROM plan_reviews WHERE project_id = ?').bind(id).first().catch(() => null);
+    project = applyReview(project, review);
+  }
   if (project?.plan?.supported) project.plan.assemblySteps = safePlanSteps(project.plan.assemblySteps);
   return project;
 }
@@ -459,7 +464,11 @@ async function handle(request) {
       const page = await bucket().list({ prefix: `ai-projects/${userHash}/`, limit: 100 });
       const projects = (await Promise.all(page.objects.map(async item => (await bucket().get(item.key))?.json()))).filter(Boolean)
         .filter(item => item.ownerId === signedIn.id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-      return json({ items: projects.map(({ id, plan, step, status, createdAt }) => ({ id, name: plan.name, desc: plan.desc, step, status, createdAt })), truncated: page.truncated });
+      const reviewed = await Promise.all(projects.map(async item => {
+        const review = env.DB ? await env.DB.prepare('SELECT * FROM plan_reviews WHERE project_id = ?').bind(item.id).first().catch(() => null) : null;
+        return applyReview(item, review);
+      }));
+      return json({ items: reviewed.map(({ id, plan, step, status, createdAt }) => ({ id, name: plan.name, desc: plan.desc, step, status, createdAt })), truncated: page.truncated });
     }
   }
   if (path.join('/') === 'pricing') return json({ unit: '造物币', coinsPerYuan: 10, generationPreview: 5, exampleUnlock: 0, communitySuggestedUnlock: 20, paymentReview: 'manual', coinSpendingEnabled: false });
